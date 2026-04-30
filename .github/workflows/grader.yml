@@ -1,0 +1,278 @@
+name: Grader
+
+on:
+  push:
+    branches-ignore:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      # ── Métrica: hashing_strength ──────────────────────────────────────────
+      - name: Check bcrypt cost factor
+        id: hashing
+        run: |
+          if ! grep -r "bcrypt" src/ --include="*.ts" -q 2>/dev/null; then
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ bcrypt not found in src/"
+            exit 0
+          fi
+
+          # Match: saltRounds = 10+ | genSalt(10+) | hash(pass, 10+)
+          # Regex (1[0-9]|[2-9][0-9]) covers 10–99
+          if grep -rE "saltRounds\s*[=:]\s*(1[0-9]|[2-9][0-9])\b" src/ --include="*.ts" -q 2>/dev/null || \
+             grep -rE "genSalt\s*\(\s*(1[0-9]|[2-9][0-9])\b" src/ --include="*.ts" -q 2>/dev/null || \
+             grep -rE "\.hash\s*\([^,]+,\s*(1[0-9]|[2-9][0-9])\b" src/ --include="*.ts" -q 2>/dev/null; then
+            echo "score=1.0" >> "$GITHUB_OUTPUT"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ bcrypt with cost ≥ 10 detected"
+          else
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ bcrypt cost < 10 or not found. Set saltRounds >= 10."
+          fi
+
+      # ── Métrica: auth_mechanism ────────────────────────────────────────────
+      - name: Check JWT mechanism
+        id: auth_mechanism
+        run: |
+          HAS_JWT=false
+          HAS_SIGN=false
+          HAS_EXPIRY=false
+
+          grep -r "jsonwebtoken\|from.*['\"]jsonwebtoken['\"]" src/ --include="*.ts" -q 2>/dev/null && HAS_JWT=true
+          grep -r "\.sign\s*(" src/ --include="*.ts" -q 2>/dev/null && HAS_SIGN=true
+          grep -r "expiresIn" src/ --include="*.ts" -q 2>/dev/null && HAS_EXPIRY=true
+
+          if $HAS_JWT && $HAS_SIGN && $HAS_EXPIRY; then
+            echo "score=1.0" >> "$GITHUB_OUTPUT"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ JWT with sign + expiresIn found"
+          else
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ JWT mechanism incomplete (need: jsonwebtoken import + .sign() + expiresIn)"
+          fi
+
+      # ── Métrica: jwt_expiration ────────────────────────────────────────────
+      - name: Check JWT expiration <= 15 min
+        id: jwt_expiration
+        run: |
+          VALID=false
+
+          # Match string durations: '1m'..'15m'
+          if grep -rE "expiresIn\s*[=:,]\s*['\"]([1-9]|1[0-5])m['\"]" src/ --include="*.ts" -q 2>/dev/null; then
+            VALID=true
+          fi
+
+          # Match numeric seconds: 1..900
+          if grep -rE "expiresIn\s*[=:,]\s*([1-9][0-9]{0,2}|900)\b" src/ --include="*.ts" -q 2>/dev/null; then
+            # Exclude large values like 3600, 7200, etc.
+            if ! grep -rE "expiresIn\s*[=:,]\s*[0-9]{4,}" src/ --include="*.ts" -q 2>/dev/null; then
+              VALID=true
+            fi
+          fi
+
+          if $VALID; then
+            echo "score=1.0" >> "$GITHUB_OUTPUT"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ JWT expiration ≤ 15 min"
+          else
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ JWT expiration > 15 min or not found (use expiresIn: '15m' or less)"
+          fi
+
+      # ── Métrica: rate_limiting ─────────────────────────────────────────────
+      - name: Check rate limiting on login
+        id: rate_limiting
+        run: |
+          if grep -r "rateLimit\|express-rate-limit\|loginRateLimit" src/ --include="*.ts" -q 2>/dev/null; then
+            echo "score=1.0" >> "$GITHUB_OUTPUT"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Rate limiting middleware found"
+          else
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ No rate limiting found in src/ (use express-rate-limit)"
+          fi
+
+      # ── Métrica: test_pass_rate ────────────────────────────────────────────
+      - name: Run integration tests
+        id: test_run
+        env:
+          DATABASE_URL: ":memory:"
+          JWT_SECRET: "grader-test-secret-do-not-use-in-prod"
+          JWT_REFRESH_SECRET: "grader-refresh-secret-do-not-use-in-prod"
+        run: |
+          set +e
+          npx jest --json --outputFile=jest-results.json 2>&1
+          TEST_EXIT=$?
+          set -e
+
+          if [ ! -f "jest-results.json" ]; then
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ Test results not found"
+            exit 0
+          fi
+
+          TOTAL=$(node -e "try{const r=require('./jest-results.json');console.log(r.numTotalTests||0)}catch(e){console.log(0)}")
+          PASSED=$(node -e "try{const r=require('./jest-results.json');console.log(r.numPassedTests||0)}catch(e){console.log(0)}")
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ No tests found — write integration tests in tests/auth/"
+          elif [ "$TEST_EXIT" -eq 0 ]; then
+            echo "score=1.0" >> "$GITHUB_OUTPUT"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ All $TOTAL tests pass"
+          else
+            RATE=$(node -e "console.log(($PASSED/$TOTAL).toFixed(3))")
+            echo "score=$RATE" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ $PASSED/$TOTAL tests pass"
+          fi
+
+      # ── Métrica: secrets_detected ──────────────────────────────────────────
+      - name: Check for hardcoded secrets
+        id: secrets
+        run: |
+          FOUND=false
+
+          # JWT_SECRET assigned to a literal string in source code
+          if grep -rE "JWT_SECRET\s*=\s*['\"][^'\"]{4,}['\"]" src/ --include="*.ts" -q 2>/dev/null; then
+            FOUND=true
+            echo "⚠️  Hardcoded JWT_SECRET detected"
+          fi
+
+          # jwt.sign called with an inline string secret (not a variable)
+          if grep -rE "jwt\.sign\s*\([^,]+,[^,]+,['\"][a-zA-Z0-9!@#\$%\^&\*]{8,}['\"]" src/ --include="*.ts" -q 2>/dev/null; then
+            FOUND=true
+            echo "⚠️  Inline secret literal in jwt.sign() detected"
+          fi
+
+          if $FOUND; then
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ Hardcoded secrets found. Read secrets from process.env only."
+          else
+            echo "score=1.0" >> "$GITHUB_OUTPUT"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ No hardcoded secrets detected"
+          fi
+
+      # ── Métrica: sast_findings ─────────────────────────────────────────────
+      - name: SAST — check for high-severity patterns
+        id: sast
+        run: |
+          FINDINGS=0
+
+          # SQL injection via string concatenation in queries
+          if grep -rE "(db\.(run|get|all|prepare)|\.query)\s*\(\s*['\`][^'\`]*\s*\+" src/ --include="*.ts" -q 2>/dev/null; then
+            FINDINGS=$((FINDINGS + 1))
+            echo "⚠️  Possible SQL injection: string concatenation in DB query"
+          fi
+
+          # eval() usage
+          if grep -rE "\beval\s*\(" src/ --include="*.ts" -q 2>/dev/null; then
+            FINDINGS=$((FINDINGS + 1))
+            echo "⚠️  eval() usage detected"
+          fi
+
+          # Logging password values
+          if grep -rEi "console\.(log|error|warn).*password" src/ --include="*.ts" -q 2>/dev/null; then
+            FINDINGS=$((FINDINGS + 1))
+            echo "⚠️  Possible password/secret logging detected"
+          fi
+
+          if [ "$FINDINGS" -eq 0 ]; then
+            echo "score=1.0" >> "$GITHUB_OUTPUT"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ No high-severity SAST findings"
+          else
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ $FINDINGS SAST finding(s) detected"
+          fi
+
+      # ── Reporte final ──────────────────────────────────────────────────────
+      - name: Build grader report
+        run: |
+          cat > grader-report.json << EOF
+          {
+            "schemaVersion": "1.0",
+            "templateSlug": "sec-auth-jwt-bcrypt",
+            "runId": "${{ github.run_id }}",
+            "sha": "${{ github.sha }}",
+            "metrics": [
+              {
+                "metricKey": "hashing_strength",
+                "score": ${{ steps.hashing.outputs.score }},
+                "passed": ${{ steps.hashing.outputs.passed }},
+                "unavailable": false
+              },
+              {
+                "metricKey": "auth_mechanism",
+                "score": ${{ steps.auth_mechanism.outputs.score }},
+                "passed": ${{ steps.auth_mechanism.outputs.passed }},
+                "unavailable": false
+              },
+              {
+                "metricKey": "jwt_expiration",
+                "score": ${{ steps.jwt_expiration.outputs.score }},
+                "passed": ${{ steps.jwt_expiration.outputs.passed }},
+                "unavailable": false
+              },
+              {
+                "metricKey": "rate_limiting",
+                "score": ${{ steps.rate_limiting.outputs.score }},
+                "passed": ${{ steps.rate_limiting.outputs.passed }},
+                "unavailable": false
+              },
+              {
+                "metricKey": "test_pass_rate",
+                "score": ${{ steps.test_run.outputs.score }},
+                "passed": ${{ steps.test_run.outputs.passed }},
+                "unavailable": false
+              },
+              {
+                "metricKey": "secrets_detected",
+                "score": ${{ steps.secrets.outputs.score }},
+                "passed": ${{ steps.secrets.outputs.passed }},
+                "unavailable": false
+              },
+              {
+                "metricKey": "sast_findings",
+                "score": ${{ steps.sast.outputs.score }},
+                "passed": ${{ steps.sast.outputs.passed }},
+                "unavailable": false
+              }
+            ]
+          }
+          EOF
+          cat grader-report.json
+
+      - name: Upload grader report
+        uses: actions/upload-artifact@v4
+        with:
+          name: grader-report
+          path: grader-report.json
