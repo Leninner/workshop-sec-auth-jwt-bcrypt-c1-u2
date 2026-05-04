@@ -1,9 +1,17 @@
-import { Router } from 'express'
-import { AuthService } from './auth.service'
-import { loginRateLimit } from './auth.middleware'
+import { Router, Response } from 'express'
+import { AuthService, AppError } from './auth.service'
+// import { loginRateLimit } from './auth.middleware'  // TODO: enable rate limiting
 
 export const authRouter = Router()
 const authService = new AuthService()
+
+function handleError(err: unknown, res: Response): void {
+  if (err instanceof AppError) {
+    res.status(err.statusCode).json({ error: err.message })
+  } else {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+}
 
 /**
  * POST /auth/register
@@ -12,12 +20,13 @@ const authService = new AuthService()
  * Status 409 if email already exists
  */
 authRouter.post('/register', async (req, res) => {
-  // TODO: implement registration
-  // 1. Extract and validate { email, password } from req.body
-  // 2. Call authService.register(email, password)
-  // 3. Return 201 with { userId, email, createdAt }
-  // 4. On duplicate email, return 409
-  res.status(501).json({ error: 'not implemented' })
+  try {
+    const { email, password } = req.body
+    const result = await authService.register(email, password)
+    res.status(201).json(result)
+  } catch (err) {
+    handleError(err, res)
+  }
 })
 
 /**
@@ -26,17 +35,18 @@ authRouter.post('/register', async (req, res) => {
  * Returns: { accessToken, refreshToken, expiresIn }
  * Status 401 if invalid credentials
  * Status 423 if user is locked
- * Status 429 if rate limit exceeded (handled by loginRateLimit middleware)
+ * Status 429 if rate limit exceeded
  *
- * Apply loginRateLimit middleware to this route.
+ * TODO: add loginRateLimit middleware to this route
  */
-authRouter.post('/login', /* TODO: add loginRateLimit here */ async (req, res) => {
-  // TODO: implement login
-  // 1. Call authService.login(email, password)
-  // 2. Return 200 with { accessToken, refreshToken, expiresIn }
-  // 3. On invalid credentials, return 401
-  // 4. On locked user, return 423
-  res.status(501).json({ error: 'not implemented' })
+authRouter.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body
+    const result = await authService.login(email, password)
+    res.status(200).json(result)
+  } catch (err) {
+    handleError(err, res)
+  }
 })
 
 /**
@@ -46,12 +56,13 @@ authRouter.post('/login', /* TODO: add loginRateLimit here */ async (req, res) =
  * Status 401 if refresh token is invalid or expired
  */
 authRouter.post('/refresh', async (req, res) => {
-  // TODO: implement token rotation
-  // 1. Extract refreshToken from req.body
-  // 2. Call authService.refresh(refreshToken)
-  // 3. Return 200 with new { accessToken, refreshToken }
-  // 4. On invalid token, return 401
-  res.status(501).json({ error: 'not implemented' })
+  try {
+    const { refreshToken } = req.body
+    const result = await authService.refresh(refreshToken)
+    res.status(200).json(result)
+  } catch (err) {
+    handleError(err, res)
+  }
 })
 
 /**
@@ -60,9 +71,11 @@ authRouter.post('/refresh', async (req, res) => {
  * Status 204 on success
  */
 authRouter.post('/logout', async (req, res) => {
-  // TODO: implement logout
-  // 1. Extract refreshToken from req.body
-  // 2. Call authService.logout(refreshToken)
-  // 3. Return 204
-  res.status(501).json({ error: 'not implemented' })
+  try {
+    const { refreshToken } = req.body
+    await authService.logout(refreshToken)
+    res.status(204).send()
+  } catch (err) {
+    handleError(err, res)
+  }
 })
